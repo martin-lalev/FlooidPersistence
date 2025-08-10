@@ -6,11 +6,14 @@
 //
 
 import Foundation
+import Combine
 import CoreData
 
 public protocol QueryExecuter<Entity> {
     associatedtype Entity
     func execute() -> [Entity]
+    func resultsPublisher() -> AnyPublisher<[Entity], Never>
+    func updatesPublisher() -> AnyPublisher<[Entity], Never>
     func subscribeToResults(_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol
     func subscribeToUpdates(_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol
     func deleteAll()
@@ -18,17 +21,23 @@ public protocol QueryExecuter<Entity> {
 
 struct AnyQueryExecuter<Entity>: QueryExecuter {
     let _execute: () -> [Entity]
+    let _resultsPublisher: () -> AnyPublisher<[Entity], Never>
+    let _updatesPublisher: () -> AnyPublisher<[Entity], Never>
     let _subscribeToResults: (_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol
     let _subscribeToUpdates: (_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol
     let _deleteAll: () -> Void
     
     init(
         execute: @escaping () -> [Entity],
+        resultsPublisher: @escaping () -> AnyPublisher<[Entity], Never>,
+        updatesPublisher: @escaping () -> AnyPublisher<[Entity], Never>,
         subscribeToResults: @escaping (_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol,
         subscribeToUpdates: @escaping (_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol,
         deleteAll: @escaping () -> Void
     ) {
         self._execute = execute
+        self._resultsPublisher = resultsPublisher
+        self._updatesPublisher = updatesPublisher
         self._subscribeToResults = subscribeToResults
         self._subscribeToUpdates = subscribeToUpdates
         self._deleteAll = deleteAll
@@ -36,6 +45,12 @@ struct AnyQueryExecuter<Entity>: QueryExecuter {
 
     func execute() -> [Entity] {
         self._execute()
+    }
+    func resultsPublisher() -> AnyPublisher<[Entity], Never> {
+        self._resultsPublisher()
+    }
+    func updatesPublisher() -> AnyPublisher<[Entity], Never> {
+        self._updatesPublisher()
     }
     func subscribeToResults(_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol {
         self._subscribeToResults(observation)
@@ -74,7 +89,7 @@ final class EntityQueryExecuter<Entity>: NSObject, @unchecked Sendable, NSFetche
         self.sort = sort
         self.mapper = mapper
         self.context = context
-        self.notificationName = Notification.Name("sdjaksdjh")
+        self.notificationName = Notification.Name(UUID().uuidString)
         self.results = NSFetchedResultsController(fetchRequest: fetchRequest, managedObjectContext: context, sectionNameKeyPath: nil, cacheName: nil)
 
         super.init()
@@ -83,6 +98,18 @@ final class EntityQueryExecuter<Entity>: NSObject, @unchecked Sendable, NSFetche
         try? self.results.performFetch()
     }
     
+    func resultsPublisher() -> AnyPublisher<[Entity], Never> {
+        self.results
+            .publisher(for: \.fetchedObjects)
+            .map { [mapper] in $0?.compactMap { [mapper] in mapper($0) } ?? [] }
+            .eraseToAnyPublisher()
+    }
+
+    func updatesPublisher() -> AnyPublisher<[Entity], Never> {
+        Just([]).merge(with: objectsDidChangePublisher())
+            .eraseToAnyPublisher()
+    }
+
     private func asFetchRequest() -> NSFetchRequest<NSManagedObject> {
         self.context.makeFetchRequest(for: entityName, predicates: filter, sortDescriptors: sort)
     }
@@ -110,6 +137,17 @@ final class EntityQueryExecuter<Entity>: NSObject, @unchecked Sendable, NSFetche
 
     func subscribeToUpdates(_ observation: @Sendable @escaping ([Entity]) -> Void) -> NSObjectProtocol {
         NotificationCenter.default.addObserver(forName: .NSManagedObjectContextObjectsDidChange, object: self, queue: nil) { [self] notification in
+            observation(mapContextObjectsDidChange(notification: notification))
+        }
+    }
+
+    private func objectsDidChangePublisher() -> some Publisher<[Entity], Never> {
+        NotificationCenter.default.publisher(for: .NSManagedObjectContextObjectsDidChange, object: context)
+            .map { [self] notification in
+                mapContextObjectsDidChange(notification: notification)
+            }
+    }
+    private func mapContextObjectsDidChange(notification: Notification) -> [Entity] {
             // let deleted = notification.userInfo?[NSDeletedObjectsKey] as? Set<NSManagedObject>
             let updated = notification.userInfo?[NSUpdatedObjectsKey] as? Set<NSManagedObject>
             let refreshed = notification.userInfo?[NSRefreshedObjectsKey] as? Set<NSManagedObject>
@@ -124,8 +162,7 @@ final class EntityQueryExecuter<Entity>: NSObject, @unchecked Sendable, NSFetche
             let sorted = NSArray(array: predicated).sortedArray(using: sort)
             let result = sorted.compactMap { $0 as? NSManagedObject }
             
-            observation(result.compactMap(mapper))
-        }
+            return result.compactMap(mapper)
     }
 }
 
